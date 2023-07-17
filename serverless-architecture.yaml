@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  LambdaBucketName:
+    Type: String
+    Description: Name of the S3 bucket where the Lambda function packages are stored
+  StageName:
+    Type: String
+    Description: Name of the API stage
+
+Resources:
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RideApiGatewayRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RideApiGatewayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:RideRequestsQueue"
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RideLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RideLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sns:Publish
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:RideRequestsQueue"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/RideRequestsTable"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/RideRequestsLocksTable"
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:DriverNotificationsTopic"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ProcessRideRequestsCF:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ProcessRideAcceptCF:*"
+
+  RideRequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RideRequestsTable
+      AttributeDefinitions:
+        - AttributeName: ride_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ride_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  RideRequestsLocksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RideRequestsLocksTable
+      AttributeDefinitions:
+        - AttributeName: ride_request_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ride_request_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  RideRequestsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: RideRequestsQueue
+      VisibilityTimeout: 300
+      ReceiveMessageWaitTimeSeconds: 20
+
+  DriverNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: DriverNotificationsTopic
+
+  ProcessRideRequestsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessRideRequestsCF
+      Runtime: python3.8
+      Handler: rideRequests.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucketName
+        S3Key: process-ride-request-package.zip
+      Timeout: 60
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      TracingConfig:
+        Mode: Active
+
+  ProcessRideAcceptLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessRideAcceptCF
+      Runtime: python3.8
+      Handler: rideResponse.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucketName
+        S3Key: process-ride-accept-package.zip
+      Timeout: 60
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      TracingConfig:
+        Mode: Active
+
+  ProcessRideAcceptLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ProcessRideAcceptCF
+      RetentionInDays: 7
+
+  ProcessRideAcceptLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessRideAcceptLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RideRequestsAPI}/*/*"
+
+  RideRequestsAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: RideRequestsAPI
+
+  RideRequestsAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RideRequestsAPI.RootResourceId
+      RestApiId: !Ref RideRequestsAPI
+      PathPart: sendrequest
+
+  RideRequestsAPIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RideRequestsAPI
+      ResourceId: !Ref RideRequestsAPIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/RideRequestsQueue"
+        IntegrationResponses:
+          - StatusCode: 200
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: "Action=SendMessage&MessageBody=$input.body"
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          StatusCode: 200
+
+  RideAcceptAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RideRequestsAPI.RootResourceId
+      RestApiId: !Ref RideRequestsAPI
+      PathPart: rideaccept
+
+  RideAcceptAPIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RideRequestsAPI
+      ResourceId: !Ref RideAcceptAPIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessRideAcceptLambda.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+        PassthroughBehavior: WHEN_NO_MATCH
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          StatusCode: 200
+
+  BetaStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref StageName
+      RestApiId: !Ref RideRequestsAPI
+      DeploymentId: !Ref BetaDeployment
+
+  BetaDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RideAcceptAPIMethod
+      - RideRequestsAPIMethod
+    Properties:
+      RestApiId: !Ref RideRequestsAPI
+      StageName: !Ref StageName
+
+
+Outputs:
+  ApiEndpoint:
+    Description: Endpoint URL for the RideRequestsAPI
+    Value: !Sub "https://${RideRequestsAPI}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"
